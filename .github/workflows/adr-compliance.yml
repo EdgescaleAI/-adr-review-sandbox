@@ -128,22 +128,46 @@ jobs:
             reason="PR adds ${ADDED} lines, exceeds ADR_MAX_ADDED_LINES=${MAX_LINES}"
           fi
           if [[ "$tripped" == "true" ]]; then
-            pr_ref=""
-            if [[ -n "${{ github.event.pull_request.html_url }}" ]]; then
-              pr_ref="${{ github.event.pull_request.html_url }}"
-            fi
-            msg="⚠️ ADR review SKIPPED — ${reason}. ${pr_ref}"
-            echo "::warning::$msg"
+            pr_url="${{ github.event.pull_request.html_url }}"
+            pr_title="${{ github.event.pull_request.title }}"
+            pr_num="${{ github.event.pull_request.number }}"
+            pr_author="${{ github.event.pull_request.user.login }}"
+            run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            repo="${{ github.repository }}"
+
+            short="⚠️ ADR review skipped on ${repo}#${pr_num} — ${reason}."
+            echo "::warning::${short}"
+
             {
-              echo "## ADR review skipped"
+              echo "## ⚠️ ADR review skipped"
               echo ""
-              echo "$msg"
+              echo "**Reason**: ${reason}"
               echo ""
-              echo "- Files changed: ${COUNT} (max: ${MAX_FILES})"
-              echo "- Added lines:   ${ADDED} (max: ${MAX_LINES})"
+              echo "| Metric | Value | Limit |"
+              echo "|---|---|---|"
+              echo "| Files changed | ${COUNT} | ${MAX_FILES} |"
+              echo "| Added lines   | ${ADDED} | ${MAX_LINES} |"
+              echo ""
+              echo "### How to proceed"
+              echo "- **Split the PR** — smaller PRs review faster."
+              echo "- **Raise the limit** for the repo: \`gh variable set ADR_MAX_ADDED_LINES --body \"2000\" --repo ${repo}\`"
+              echo "- **Bypass review**: add the \`skip-adr-review\` label to this PR"
+              echo ""
+              echo "[View PR](${pr_url:-$run_url}) · [View run](${run_url})"
             } >> "$GITHUB_STEP_SUMMARY"
+
+            # Rich multi-line message for chat (Google Chat / Slack both accept {text})
             if [[ -n "${{ secrets.ADR_NOTIFICATION_WEBHOOK_URL }}" ]]; then
-              payload=$(jq -n --arg t "$msg" '{text: $t}')
+              chat_text=$(printf '%s\n\n*Reason*: %s\n\n• Files changed: %s (limit %s)\n• Added lines: %s (limit %s)\n• Branch: %s\n• Author: %s\n\n*How to proceed:*\n• Split the PR, or\n• Raise the limit (repo var `ADR_MAX_ADDED_LINES`), or\n• Add `skip-adr-review` label to bypass\n\n<%s|View PR> · <%s|View run>' \
+                "${short}" \
+                "${reason}" \
+                "${COUNT}" "${MAX_FILES}" \
+                "${ADDED}" "${MAX_LINES}" \
+                "${{ github.head_ref }}" \
+                "${pr_author:-unknown}" \
+                "${pr_url:-$run_url}" \
+                "${run_url}")
+              payload=$(jq -n --arg t "$chat_text" '{text: $t}')
               curl -sS -X POST -H "Content-Type: application/json" \
                 -d "$payload" "${{ secrets.ADR_NOTIFICATION_WEBHOOK_URL }}" \
                 >/dev/null 2>&1 || true
