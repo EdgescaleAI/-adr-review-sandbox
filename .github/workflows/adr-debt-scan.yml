@@ -1,0 +1,536 @@
+name: ADR Debt Scan (weekly full-repo)
+
+# Weekly full-repo scan against EdgescaleAI's live ADR catalog.
+#
+# Runs every Monday 09:00 UTC (also manually dispatchable).
+# Scans all tracked non-binary files, generates unified-diff patches for
+# every violation, combines patches that apply cleanly into ONE rollup PR
+# (chore/adr-debt-<date>), and upserts ONE tracker issue listing every
+# violation — including those whose patch could not be auto-applied.
+#
+# Companion to adr-compliance.yml (per-PR diff review). Supersedes the
+# older compliance-review.yml (static SELECTED_RULES.md pattern).
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Mondays 09:00 UTC — one slice per week
+  workflow_dispatch:
+    inputs:
+      slice:
+        description: 'Override the ISO-week rotation (slice name from .github/adr-scan-slices.yml). Empty = use this week.'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Print what would be reviewed + skip all Claude calls.'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: adr-debt-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # push chore/adr-debt-<date>
+      pull-requests: write   # open/update rollup PR
+      issues: write          # upsert tracker issue
+    env:
+      # Sandbox mode: no engine / Auth0. Inline rules from .github/adr-inline-rules.md
+      INLINE_RULES_FILE: .github/adr-inline-rules.md
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MAX_PARALLEL: '4'
+      # Guardrails — overridable via repo variables (vars.*) if needed
+      ADR_SCAN_MAX_FILES: ${{ vars.ADR_SCAN_MAX_FILES || '100' }}
+      ADR_SCAN_MAX_VIOLATIONS_TO_PATCH: ${{ vars.ADR_SCAN_MAX_VIOLATIONS_TO_PATCH || '20' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Claude Code CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Install yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+      - name: Verify tools
+        run: |
+          which claude || { echo "::error::Claude CLI not on PATH"; exit 1; }
+          jq --version
+          yq --version
+
+      - name: Select this week's slice
+        id: slice
+        run: |
+          set -uo pipefail
+          SLICE_FILE=".github/adr-scan-slices.yml"
+          if [[ ! -f "$SLICE_FILE" ]]; then
+            echo "::error::Slice config not found at $SLICE_FILE"
+            exit 1
+          fi
+
+          total=$(yq '.slices | length' "$SLICE_FILE")
+          override="${{ github.event.inputs.slice }}"
+          if [[ -n "$override" ]]; then
+            name="$override"
+          else
+            week=$(date -u +%V)
+            # Strip leading zero to avoid octal interpretation
+            week=${week#0}
+            idx=$(( week % total ))
+            name=$(yq ".slices[$idx].name" "$SLICE_FILE")
+          fi
+
+          # Extract the slice's paths
+          PATHS_FILE=$(mktemp)
+          yq -r ".slices[] | select(.name == \"$name\") | .paths[]" "$SLICE_FILE" > "$PATHS_FILE"
+          if [[ ! -s "$PATHS_FILE" ]]; then
+            echo "::error::Slice '$name' not found or has no paths"
+            exit 1
+          fi
+
+          echo "slice_name=$name" >> "$GITHUB_OUTPUT"
+          echo "SLICE_NAME=$name" >> "$GITHUB_ENV"
+          echo "PATHS_FILE=$PATHS_FILE" >> "$GITHUB_ENV"
+          echo "Slice: $name (of $total total, rotating weekly by ISO-week)"
+          echo "Paths:"
+          sed 's/^/  /' "$PATHS_FILE"
+
+      - name: Load inline rules (sandbox mode — no engine API call)
+        run: |
+          if [[ ! -f "$INLINE_RULES_FILE" ]]; then
+            echo "::error::Inline rules file not found at $INLINE_RULES_FILE"
+            exit 1
+          fi
+          RULE_COUNT=$(grep -cE '^### adr-[0-9]+' "$INLINE_RULES_FILE" || echo 0)
+          if [[ "$RULE_COUNT" == "0" ]]; then
+            echo "::error::No rules found in $INLINE_RULES_FILE"
+            exit 1
+          fi
+          echo "Loaded $RULE_COUNT inline rule(s) from $INLINE_RULES_FILE"
+
+      - name: List reviewable files in this slice
+        id: files
+        run: |
+          set -uo pipefail
+
+          # Build a slice-path matcher: paths ending in / are prefix matches;
+          # './' means root-level files only (no directory separator).
+          matches_slice() {
+            local f="$1"
+            while IFS= read -r p; do
+              [[ -z "$p" ]] && continue
+              if [[ "$p" == "./" ]]; then
+                [[ "$f" != */* ]] && return 0
+              else
+                [[ "$f" == "$p"* ]] && return 0
+              fi
+            done < "$PATHS_FILE"
+            return 1
+          }
+
+          : > /tmp/review_files.txt
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            # Standard filter: binaries, lockfiles, vendored paths
+            case "${f,,}" in
+              *.png|*.jpg|*.jpeg|*.gif|*.bmp|*.svg|*.ico|*.pdf|*.zip|*.tar|*.tar.gz|*.tgz|*.gz|*.bz2|*.jar|*.so|*.dylib|*.exe|*.dll|*.bin|*.woff|*.woff2|*.ttf|*.otf|*.eot|*.mp4|*.mov|*.webm|*.webp|*.pkg)
+                continue ;;
+            esac
+            case "$(basename "$f")" in
+              package-lock.json|yarn.lock|pnpm-lock.yaml|Cargo.lock|Gemfile.lock|poetry.lock|go.sum|composer.lock)
+                continue ;;
+            esac
+            case "/$f/" in
+              */node_modules/*|*/vendor/*|*/dist/*|*/build/*|*/.next/*|*/.nuxt/*|*/__pycache__/*|*/.venv/*|*/venv/*)
+                continue ;;
+            esac
+            # Slice filter
+            matches_slice "$f" || continue
+            [[ -f "$f" ]] && echo "$f" >> /tmp/review_files.txt
+          done < <(git ls-files)
+
+          COUNT=$(wc -l < /tmp/review_files.txt | xargs)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Files in slice '$SLICE_NAME' to scan: $COUNT"
+          head -20 /tmp/review_files.txt || true
+
+      - name: Size guardrail
+        id: guardrail
+        run: |
+          set -uo pipefail
+          COUNT="${{ steps.files.outputs.count }}"
+          MAX="$ADR_SCAN_MAX_FILES"
+          tripped=false
+          reason=""
+          if [[ "$DRY_RUN" == "true" ]]; then
+            tripped=true
+            reason="dry_run=true — Claude calls skipped"
+          elif (( COUNT > MAX )); then
+            tripped=true
+            reason="slice '${SLICE_NAME}' has ${COUNT} files, exceeds ADR_SCAN_MAX_FILES=${MAX}"
+          fi
+          if [[ "$tripped" == "true" ]]; then
+            msg="⚠️ ADR debt scan SKIPPED for slice \`${SLICE_NAME}\` — ${reason}. ($COUNT files would have been scanned.)"
+            echo "::warning::$msg"
+            {
+              echo "## ADR Debt Scan — skipped"
+              echo ""
+              echo "$msg"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [[ -n "${{ secrets.ADR_NOTIFICATION_WEBHOOK_URL }}" ]]; then
+              payload=$(jq -n --arg t "$msg" '{text: $t}')
+              curl -sS -X POST -H "Content-Type: application/json" \
+                -d "$payload" "${{ secrets.ADR_NOTIFICATION_WEBHOOK_URL }}" \
+                >/dev/null 2>&1 || true
+            fi
+            echo "tripped=true" >> "$GITHUB_OUTPUT"
+            echo "GUARDRAIL_TRIPPED=true" >> "$GITHUB_ENV"
+          else
+            echo "tripped=false" >> "$GITHUB_OUTPUT"
+            echo "GUARDRAIL_TRIPPED=false" >> "$GITHUB_ENV"
+            echo "Guardrail OK: $COUNT / $MAX files."
+          fi
+
+      - name: Per-file ADR review (batched parallel)
+        if: steps.files.outputs.count != '0' && env.GUARDRAIL_TRIPPED != 'true'
+        run: |
+          set -uo pipefail
+          OUTPUT_FILE=/tmp/adr_output.txt
+          TMPDIR_REV=$(mktemp -d)
+          : > "$OUTPUT_FILE"
+          : > /tmp/adr_cost.log    # per-call cost tracker (one USD value per line)
+          echo "OUTPUT_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
+
+          # Load inline rules once for all review calls
+          INLINE_RULES=$(cat "$INLINE_RULES_FILE")
+
+          declare -a FILE_LIST
+          idx=0
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            idx=$((idx + 1))
+            FILE_LIST[$idx]="$file"
+          done < /tmp/review_files.txt
+          FILE_COUNT=$idx
+          echo "Scanning $FILE_COUNT files ($MAX_PARALLEL in parallel)..."
+
+          review_one() {
+            local i="$1"
+            local file="${FILE_LIST[$i]}"
+            local out="$TMPDIR_REV/$i.out"
+            local prompt_file
+            prompt_file=$(mktemp)
+            {
+              printf '%s\n' "Review this file against the ADR rules below."
+              printf '\n'
+              printf '%s\n' "RULES:"
+              printf '%s\n' "$INLINE_RULES"
+              printf '\n'
+              printf '%s\n' "FILE: $file"
+              printf '%s\n' "CONTENT (first 500 lines):"
+              [[ -r "$file" ]] && head -n 500 "$file"
+              printf '\n'
+              printf '%s\n' "Output format — one line per violation:"
+              printf '%s\n' "BLOCK|adr-id|file:line|description"
+              printf '%s\n' "FIX: what to change"
+              printf '\n'
+              printf '%s\n' "If clean: PASS"
+            } > "$prompt_file"
+            __raw=$(mktemp)
+            if claude -p "$(cat "$prompt_file")" --allowedTools Read,Bash --output-format json >"$__raw" 2>/dev/null && jq -e .result "$__raw" >/dev/null 2>&1; then
+              jq -r '.result // ""' "$__raw" > "$out"
+              jq -r '.total_cost_usd // 0' "$__raw" >> /tmp/adr_cost.log
+            else
+              cp "$__raw" "$out" 2>/dev/null || echo "__ERROR__" > "$out"
+            fi
+            rm -f "$__raw"
+            rm -f "$prompt_file"
+          }
+
+          batch_num=0
+          total_batches=$(( (idx + MAX_PARALLEL - 1) / MAX_PARALLEL ))
+          for ((start=1; start<=idx; start+=MAX_PARALLEL)); do
+            batch_num=$((batch_num + 1))
+            end=$((start + MAX_PARALLEL - 1))
+            (( end > idx )) && end=$idx
+            echo "── Batch ${batch_num}/${total_batches} (files ${start}-${end}) ──"
+            pids=()
+            for ((i=start; i<=end; i++)); do
+              review_one "$i" &
+              pids+=($!)
+            done
+            wait "${pids[@]}" 2>/dev/null || true
+            for ((i=start; i<=end; i++)); do
+              f="${FILE_LIST[$i]}"
+              out="$TMPDIR_REV/$i.out"
+              [[ -s "$out" ]] || continue
+              if grep -qE '^\**BLOCK\|' "$out"; then
+                v=$(grep -cE '^\**BLOCK\|' "$out")
+                echo "  [$i/$FILE_COUNT] $f — $v violation(s)"
+                cat "$out" >> "$OUTPUT_FILE"
+              fi
+            done
+          done
+
+          BLOCK_COUNT=$(grep -cE '^\**BLOCK\|' "$OUTPUT_FILE" 2>/dev/null || echo "0")
+          echo "block_count=$BLOCK_COUNT" >> "$GITHUB_ENV"
+          echo "Total violations: $BLOCK_COUNT"
+
+      - name: Generate patches
+        if: env.block_count != '' && env.block_count != '0' && env.GUARDRAIL_TRIPPED != 'true'
+        run: |
+          set -uo pipefail
+          PATCHES_DIR=/tmp/patches
+          mkdir -p "$PATCHES_DIR"
+          echo "PATCHES_DIR=$PATCHES_DIR" >> "$GITHUB_ENV"
+
+          # Per-violation markdown blocks used in the tracker issue body.
+          VIOLATIONS_BLOCKS=/tmp/violations_blocks.md
+          : > "$VIOLATIONS_BLOCKS"
+          echo "VIOLATIONS_BLOCKS=$VIOLATIONS_BLOCKS" >> "$GITHUB_ENV"
+
+          # Tab-separated lookup: "NNN<TAB>adr-id<TAB>path:line" — consumed
+          # by the apply step to build applied/skipped lists by patch number.
+          PATCH_MAP=/tmp/patch_map.tsv
+          : > "$PATCH_MAP"
+          echo "PATCH_MAP=$PATCH_MAP" >> "$GITHUB_ENV"
+
+          mapfile -t BLOCK_LINES < <(grep -nE '^\**BLOCK\|' "$OUTPUT_FILE" | cut -d: -f1)
+
+          # Patch cap: generate patches for at most N violations to cap cost.
+          # Remainder are listed in the tracker issue (no Claude patch call).
+          MAX_PATCHES="$ADR_SCAN_MAX_VIOLATIONS_TO_PATCH"
+          EXTRAS_LIST=/tmp/extras_list.md
+          : > "$EXTRAS_LIST"
+          echo "EXTRAS_LIST=$EXTRAS_LIST" >> "$GITHUB_ENV"
+
+          violation_idx=0
+          for line_no in "${BLOCK_LINES[@]}"; do
+            violation_idx=$((violation_idx + 1))
+            block_line=$(sed -n "${line_no}p" "$OUTPUT_FILE")
+            fix_line=$(awk -v start="$line_no" 'NR>start && /^FIX:/{print; exit}' "$OUTPUT_FILE")
+
+            adr_id=$(echo "$block_line" | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}')
+            file_line=$(echo "$block_line" | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3); print $3}')
+            desc=$(echo "$block_line" | awk -F'|' '{
+              s=""; for(i=4;i<=NF;i++) s = s $i (i<NF?"|":"");
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); print s
+            }')
+            v_file=$(echo "$file_line" | awk -F':' '{print $1}')
+            v_line=$(echo "$file_line" | awk -F':' '{print $2}' | grep -oE '^[0-9]+' || true)
+
+            # Per-violation markdown block (for the tracker issue)
+            {
+              printf '### %s — %s:%s\n' "$adr_id" "$v_file" "${v_line:-?}"
+              printf '%s\n\n' "$desc"
+              [[ -n "$fix_line" ]] && printf '**Fix**: %s\n' "$(echo "$fix_line" | sed 's/^FIX:[[:space:]]*//')"
+              printf '\n'
+            } >> "$VIOLATIONS_BLOCKS"
+
+            # Beyond the patch cap: add to the tracker issue's "not patched"
+            # list without spending tokens on a patch Claude call.
+            if (( violation_idx > MAX_PATCHES )); then
+              echo "- ${adr_id} · ${v_file}:${v_line:-?}" >> "$EXTRAS_LIST"
+              continue
+            fi
+
+            # Lookup row for the apply step (only for violations we patched)
+            printf '%03d\t%s\t%s:%s\n' "$violation_idx" "$adr_id" "$v_file" "${v_line:-?}" >> "$PATCH_MAP"
+
+            echo "Patch $violation_idx: $adr_id — $v_file:${v_line:-?}"
+            patch_prompt=$(mktemp)
+            {
+              printf '%s\n' "Produce a single unified diff (git diff format) that fixes this ADR violation."
+              printf '\n'
+              printf '%s\n' "$block_line"
+              printf '%s\n' "$fix_line"
+              printf '\n'
+              printf '%s\n' "Rules:"
+              printf '%s\n' "- Output ONLY the patch — no explanation, no markdown fences"
+              printf '%s\n' "- Start with 'diff --git a/<file> b/<file>'"
+              printf '%s\n' "- Minimal change, only what this violation requires"
+              printf '%s\n' "- Do not touch unrelated code or other files"
+            } > "$patch_prompt"
+
+            RAW=$(mktemp)
+            __jraw=$(mktemp)
+            if claude -p "$(cat "$patch_prompt")" --allowedTools Read,Bash --output-format json >"$__jraw" 2>/dev/null && jq -e .result "$__jraw" >/dev/null 2>&1; then
+              jq -r '.result // ""' "$__jraw" > "$RAW"
+              jq -r '.total_cost_usd // 0' "$__jraw" >> /tmp/adr_cost.log
+            else
+              cp "$__jraw" "$RAW" 2>/dev/null || : > "$RAW"
+            fi
+            rm -f "$__jraw"
+            rm -f "$patch_prompt"
+
+            SANITIZED="$PATCHES_DIR/$(printf '%03d' "$violation_idx").patch"
+            awk '/^diff --git/{p=1} p' "$RAW" > "$SANITIZED"
+            rm -f "$RAW"
+            [[ -s "$SANITIZED" ]] || rm -f "$SANITIZED"
+          done
+
+          PATCH_COUNT=$(ls "$PATCHES_DIR"/*.patch 2>/dev/null | wc -l | xargs)
+          echo "Generated $PATCH_COUNT patch file(s) out of $violation_idx violations."
+
+      - name: Apply patches to fix branch
+        id: apply
+        if: env.block_count != '' && env.block_count != '0' && env.GUARDRAIL_TRIPPED != 'true'
+        run: |
+          set -uo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          BRANCH="chore/adr-debt-${SLICE_NAME}-$DATE"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+          echo "DATE=$DATE" >> "$GITHUB_ENV"
+
+          git config user.name "adr-debt-bot"
+          git config user.email "adr-debt-bot@users.noreply.github.com"
+
+          git checkout main
+          git branch -D "$BRANCH" 2>/dev/null || true
+          git checkout -b "$BRANCH"
+
+          APPLIED=0
+          SKIPPED=0
+          APPLIED_LIST=/tmp/applied_list.md
+          SKIPPED_LIST=/tmp/skipped_list.md
+          : > "$APPLIED_LIST"; : > "$SKIPPED_LIST"
+          for p in $(ls "$PATCHES_DIR"/*.patch 2>/dev/null | sort); do
+            name=$(basename "$p")              # e.g. "007.patch"
+            idx="${name%.patch}"               # "007"
+            # Look up adr-id + file:line for this patch index
+            row=$(grep -m1 "^${idx}"$'\t' "$PATCH_MAP" || true)
+            adr=$(echo "$row" | awk -F'\t' '{print $2}')
+            loc=$(echo "$row" | awk -F'\t' '{print $3}')
+            [[ -z "$adr" ]] && adr="(unknown)"
+            [[ -z "$loc" ]] && loc="$name"
+
+            if git apply --check "$p" 2>/dev/null && git apply "$p" 2>/dev/null; then
+              APPLIED=$((APPLIED + 1))
+              echo "- ${adr} · ${loc}" >> "$APPLIED_LIST"
+            else
+              SKIPPED=$((SKIPPED + 1))
+              echo "- ${adr} · ${loc}" >> "$SKIPPED_LIST"
+            fi
+          done
+
+          echo "APPLIED_COUNT=$APPLIED" >> "$GITHUB_ENV"
+          echo "SKIPPED_COUNT=$SKIPPED" >> "$GITHUB_ENV"
+          echo "APPLIED_LIST=$APPLIED_LIST" >> "$GITHUB_ENV"
+          echo "SKIPPED_LIST=$SKIPPED_LIST" >> "$GITHUB_ENV"
+          echo "Applied: $APPLIED, Skipped: $SKIPPED"
+
+          if [[ "$APPLIED" == "0" ]]; then
+            echo "::warning::No patches applied cleanly."
+            echo "have_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git add -A
+          git commit \
+            -m "chore: ADR debt fixes — ${SLICE_NAME} — $DATE" \
+            -m "Applied $APPLIED patch(es) from the weekly ADR compliance scan of the '${SLICE_NAME}' slice. See the tracker issue for the full violation list and any patches that could not be auto-applied."
+          git push --force origin "$BRANCH"
+          echo "have_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upsert tracker issue
+        if: env.block_count != '' && env.block_count != '0' && env.GUARDRAIL_TRIPPED != 'true'
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          TITLE="ADR Compliance Debt — ${SLICE_NAME} — $DATE"
+
+          ISSUE_BODY=/tmp/issue_body.md
+          {
+            cat "$VIOLATIONS_BLOCKS"
+            if [[ -s "${SKIPPED_LIST:-/dev/null}" ]]; then
+              echo "---"
+              echo ""
+              echo "**Did not apply cleanly** (need manual fix):"
+              cat "$SKIPPED_LIST"
+            fi
+            if [[ -s "${EXTRAS_LIST:-/dev/null}" ]]; then
+              echo ""
+              echo "---"
+              echo ""
+              echo "**Over patch cap** (no patch generated — auto-fix capped at \`ADR_SCAN_MAX_VIOLATIONS_TO_PATCH=${ADR_SCAN_MAX_VIOLATIONS_TO_PATCH}\`):"
+              cat "$EXTRAS_LIST"
+            fi
+          } > "$ISSUE_BODY"
+
+          EXISTING=$(gh api "repos/${REPO}/issues?state=open&labels=adr-debt" \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "Updating existing tracker issue #$EXISTING"
+            gh issue edit "$EXISTING" --repo "$REPO" --body-file "$ISSUE_BODY"
+          else
+            echo "Creating new tracker issue"
+            gh issue create --repo "$REPO" \
+              --title "$TITLE" \
+              --body-file "$ISSUE_BODY" \
+              --label adr-debt
+          fi
+
+      - name: Open/update rollup PR
+        if: env.block_count != '' && env.block_count != '0' && env.GUARDRAIL_TRIPPED != 'true' && steps.apply.outputs.have_changes == 'true'
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          PR_TITLE="chore: ADR debt fixes — ${SLICE_NAME} — $DATE"
+          PR_BODY=/tmp/pr_body.md
+          {
+            if [[ -s "${APPLIED_LIST:-/dev/null}" ]]; then
+              echo "**Applied** (${APPLIED_COUNT:-0}):"
+              cat "$APPLIED_LIST"
+            fi
+            if [[ -s "${SKIPPED_LIST:-/dev/null}" ]]; then
+              echo ""
+              echo "**Not auto-fixed** (${SKIPPED_COUNT:-0} — manual review needed):"
+              cat "$SKIPPED_LIST"
+            fi
+          } > "$PR_BODY"
+
+          EXISTING=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "Updating existing PR #$EXISTING"
+            gh pr edit "$EXISTING" --repo "$REPO" --title "$PR_TITLE" --body-file "$PR_BODY"
+          else
+            echo "Creating new PR"
+            gh pr create --repo "$REPO" \
+              --base main \
+              --head "$BRANCH" \
+              --title "$PR_TITLE" \
+              --body-file "$PR_BODY" \
+              --label adr-debt
+          fi
+
+      - name: Report Claude cost for this run
+        if: always()
+        run: |
+          if [[ -s /tmp/adr_cost.log ]]; then
+            total=$(awk '{s+=$1} END{printf "%.4f", s+0}' /tmp/adr_cost.log)
+            calls=$(wc -l < /tmp/adr_cost.log | xargs)
+            msg="💰 Claude usage: ${calls} call(s), total \$${total} USD (reported by Claude Code CLI --output-format json). Slice: ${SLICE_NAME:-unknown}."
+            echo "$msg"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No Claude calls recorded (guardrail tripped or dry-run)."
+          fi
