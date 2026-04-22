@@ -109,8 +109,15 @@ jobs:
 
       - name: Size guardrail
         id: guardrail
+        env:
+          HAS_FORCE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'adr-review-force') }}
         run: |
           set -uo pipefail
+          if [[ "$HAS_FORCE_LABEL" == "true" ]]; then
+            echo "::notice::adr-review-force label present — bypassing size guardrail, running full review"
+            echo "GUARDRAIL_TRIPPED=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
           COUNT="${{ steps.files.outputs.count }}"
           ADDED="${{ steps.files.outputs.added }}"
           MAX_FILES="$ADR_MAX_CHANGED_FILES"
@@ -149,16 +156,17 @@ jobs:
               echo "| Added lines   | ${ADDED} | ${MAX_LINES} |"
               echo ""
               echo "### How to proceed"
+              echo "- **Run review anyway**: add the \`adr-review-force\` label (bypasses size guardrail, runs full review)"
               echo "- **Split the PR** — smaller PRs review faster."
               echo "- **Raise the limit** for the repo: \`gh variable set ADR_MAX_ADDED_LINES --body \"2000\" --repo ${repo}\`"
-              echo "- **Bypass review**: add the \`skip-adr-review\` label to this PR"
+              echo "- **Skip review entirely**: add the \`skip-adr-review\` label to this PR"
               echo ""
               echo "[View PR](${pr_url:-$run_url}) · [View run](${run_url})"
             } >> "$GITHUB_STEP_SUMMARY"
 
             # Rich multi-line message for chat (Google Chat / Slack both accept {text})
             if [[ -n "${{ secrets.ADR_NOTIFICATION_WEBHOOK_URL }}" ]]; then
-              chat_text=$(printf '%s\n\n*Reason*: %s\n\n• Files changed: %s (limit %s)\n• Added lines: %s (limit %s)\n• Branch: %s\n• Author: %s\n\n*How to proceed:*\n• Split the PR, or\n• Raise the limit (repo var `ADR_MAX_ADDED_LINES`), or\n• Add `skip-adr-review` label to bypass\n\n<%s|View PR> · <%s|View run>' \
+              chat_text=$(printf '%s\n\n*Reason*: %s\n\n• Files changed: %s (limit %s)\n• Added lines: %s (limit %s)\n• Branch: %s\n• Author: %s\n\n*To run the review anyway*: add the `adr-review-force` label to the PR.\n\n*Other options:*\n• Split the PR, or\n• Raise the limit (repo var `ADR_MAX_ADDED_LINES`), or\n• Add `skip-adr-review` label to skip entirely\n\n<%s|View PR> · <%s|View run>' \
                 "${short}" \
                 "${reason}" \
                 "${COUNT}" "${MAX_FILES}" \
