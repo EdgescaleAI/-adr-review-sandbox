@@ -1,0 +1,20 @@
+# Slice rotation for adr-debt-scan.yml — sandbox test config.
+#
+# Mirrors EdgescaleAI/contrib's layout (this repo is the talos/sidero
+# examples from ~Aug 2024).
+
+slices:
+  - name: terraform           # terraform examples (equinix, vultr, …)
+    paths:
+      - "examples/terraform/"
+  - name: omni                # Talos/omni infra patches
+    paths:
+      - "examples/omni/"
+  - name: pulumi              # Pulumi IaC (azure, gcp, equinix-metal)
+    paths:
+      - "examples/pulumi/"
+  - name: misc                # root + hack + .github
+    paths:
+      - "./"
+      - "hack/"
+      - ".github/"
